@@ -18,8 +18,23 @@ directly aligned with Timecell's product vision.
   diversification gaps, and a crisp overall verdict
 - **Context-aware AI insights** using recent stock news + quarterly financial signals
 - **Built-in ML forecast model** for next-day / 5-day return and risk band per holding
+- **🆕 Analysis Confidence Rating** — quantifies reliability of AI insights based on:
+  - Data Quality (price & signal coverage)
+  - Market Stability (volatility & predictability)
+  - Portfolio Diversification (concentration metrics)
+  - ML Model Strength (directional accuracy & consistency)
 
 ---
+
+## Confidence Rating Explained
+
+The **Analysis Confidence Score (0-100%)** measures how reliable the AI's portfolio recommendations are:
+
+- **≥75% (High)**: Comprehensive data, stable market, well-diversified portfolio, strong ML consensus → *Recommended for decision-making*
+- **55–74% (Moderate)**: Good data quality but with some limitations → *Use with caution; supplement with other research*
+- **<55% (Low)**: Sparse data, high volatility, concentrated portfolio, or weak ML signals → *Treat as preliminary; gather more data before acting*
+
+Each confidence component is shown in a collapsible breakdown so you understand what affects the score.
 
 ## Setup
 

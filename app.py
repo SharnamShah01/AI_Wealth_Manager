@@ -1,14 +1,29 @@
 import streamlit as st
+from streamlit.errors import StreamlitSecretNotFoundError
 import pandas as pd
 import numpy as np
 import plotly.express as px
 import plotly.graph_objects as go
 import os
+import re
 import time
+import json
+import concurrent.futures
 import requests
 import google.generativeai as genai
 from google.api_core.exceptions import GoogleAPICallError, PermissionDenied, ResourceExhausted
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.model_selection import TimeSeriesSplit
+from sklearn.preprocessing import StandardScaler
 import yfinance as yf
+from datetime import datetime, timedelta
+
+def safe_secret_get(key: str, default: str = "") -> str:
+    try:
+        return st.secrets.get(key, default)
+    except (StreamlitSecretNotFoundError, FileNotFoundError):
+        return default
+
 
 PREFERRED_GEMINI_MODELS = [
     "models/gemini-2.5-flash",
@@ -71,7 +86,11 @@ def build_model_candidates(api_key: str) -> list[str]:
     return ordered
 
 
-def generate_with_retry(api_key: str, prompt: str) -> tuple[str, str]:
+def stream_with_retry(api_key: str, prompt: str):
+    """
+    Streams a Gemini response. Returns (chunk_generator, model_name).
+    The chunk_generator yields text strings as Gemini produces them.
+    """
     genai.configure(api_key=api_key)
     last_error = None
 
@@ -79,7 +98,44 @@ def generate_with_retry(api_key: str, prompt: str) -> tuple[str, str]:
         model = genai.GenerativeModel(model_name)
         for attempt in range(3):
             try:
-                response = model.generate_content(prompt)
+                response = model.generate_content(prompt, stream=True)
+
+                def _chunk_gen(resp):
+                    for chunk in resp:
+                        text = getattr(chunk, "text", None)
+                        if text:
+                            yield text
+
+                return _chunk_gen(response), model_name
+            except ResourceExhausted as e:
+                last_error = e
+                time.sleep(2 * (attempt + 1))
+            except GoogleAPICallError as e:
+                if "429" in str(e):
+                    last_error = e
+                    time.sleep(2 * (attempt + 1))
+                else:
+                    raise
+
+    if last_error:
+        raise last_error
+    raise ResourceExhausted("Rate limit reached across available Gemini models.")
+
+
+def generate_with_retry(
+    api_key: str,
+    prompt: str,
+    generation_config: "genai.types.GenerationConfig | None" = None,
+) -> tuple[str, str]:
+    """Non-streaming fallback — kept for any future use."""
+    genai.configure(api_key=api_key)
+    last_error = None
+
+    for model_name in build_model_candidates(api_key):
+        model = genai.GenerativeModel(model_name)
+        for attempt in range(3):
+            try:
+                response = model.generate_content(prompt, generation_config=generation_config)
                 text = getattr(response, "text", None) or "No text was returned by Gemini for this prompt."
                 return text, model_name
             except ResourceExhausted as e:
@@ -140,10 +196,9 @@ st.markdown("""
     .section-title {
         font-size: 1.15rem;
         font-weight: 600;
-        color: #1e293b;
         margin-bottom: 10px;
         padding-bottom: 6px;
-        border-bottom: 2px solid #e2e8f0;
+        border-bottom: 2px solid rgba(128, 128, 128, 0.3);
     }
     .stDataFrame { border-radius: 10px; overflow: hidden; }
     div[data-testid="stSidebar"] { background-color: #0f172a; }
@@ -167,12 +222,13 @@ st.markdown("""
 # ─────────────────────────────────────────────
 st.markdown("""
 <div style='margin-bottom: 24px;'>
-    <h1 style='font-size:2rem; font-weight:700; margin:0; color:#0f172a;'>📈 AI Portfolio Advisor</h1>
-    <p style='color:#64748b; margin:4px 0 0; font-size:0.95rem;'>
+    <h1 style='font-size:2rem; font-weight:700; margin:0;'>📈 AI Portfolio Advisor</h1>
+    <p style='margin:4px 0 0; font-size:0.95rem; opacity:0.8;'>
         Live portfolio analytics · Powered by Google Gemini
     </p>
 </div>
 """, unsafe_allow_html=True)
+
 
 # ─────────────────────────────────────────────
 # Sidebar — Portfolio Input
@@ -214,17 +270,38 @@ with st.sidebar:
     )
 
     st.markdown("---")
+
+    # ⚠️ TODO: REMOVE BEFORE COMMIT — Temporary local testing inputs ⚠️
+    with st.expander("🔑 API Keys (Local Testing Only)", expanded=True):
+        st.caption("⚠️ For local testing only. Leave blank to use Streamlit secrets / environment variables. **Remove this block before committing.**")
+        manual_google_key = st.text_input(
+            "Google Gemini API Key",
+            type="password",
+            placeholder="Paste your GOOGLE_API_KEY here...",
+            key="manual_google_api_key",
+        )
+        manual_exchange_key = st.text_input(
+            "ExchangeRate API Key",
+            type="password",
+            placeholder="Paste your EXCHANGERATE_API_KEY here (optional)...",
+            key="manual_exchange_api_key",
+        )
+    # ⚠️ END TODO ⚠️
+
     configured_api_key = (
-        os.getenv("GOOGLE_API_KEY")
+        manual_google_key.strip()
+        or os.getenv("GOOGLE_API_KEY")
         or os.getenv("GEMINI_API_KEY")
-        or st.secrets.get("GOOGLE_API_KEY", "")
-        or st.secrets.get("GEMINI_API_KEY", "")
+        or safe_secret_get("GOOGLE_API_KEY", "")
+        or safe_secret_get("GEMINI_API_KEY", "")
     )
+
     api_key = configured_api_key
     analyze_btn = st.button("🤖 Analyze with Gemini AI")
 
     st.markdown("---")
     st.caption("Google Gemini API")
+
 
 # ─────────────────────────────────────────────
 # Price fetching (cached 5 min)
@@ -333,83 +410,355 @@ def fetch_market_context(tickers_with_suffix: list[str]) -> dict:
     return context
 
 
+# ─────────────────────────────────────────────
+# Confidence Rating System
+# ─────────────────────────────────────────────
+def calculate_data_quality_score(df: pd.DataFrame, ml_signals: dict) -> float:
+    """
+    Scores data quality based on:
+    - Percentage of holdings with valid prices
+    - Percentage of holdings with ML signals
+    Returns: 0-100 score
+    """
+    if df.empty:
+        return 0.0
+    
+    price_coverage = (df["Current Price"].notna().sum() / len(df)) * 100
+    
+    ml_signal_count = 0
+    for ticker in df["_lookup"].unique():
+        if ticker in ml_signals and ml_signals[ticker]:
+            ml_signal_count += 1
+    ml_coverage = (ml_signal_count / len(df.drop_duplicates(subset=["_lookup"]))) * 100
+    
+    data_quality = (price_coverage * 0.6 + ml_coverage * 0.4)
+    return float(np.clip(data_quality, 0, 100))
+
+
+def calculate_market_stability_score(df: pd.DataFrame, ml_signals: dict) -> float:
+    """
+    Scores market stability based on:
+    - Portfolio volatility (lower is better)
+    - Consistency of ML directional accuracy
+    Returns: 0-100 score (higher = more stable, more predictable)
+    """
+    if df.empty or not ml_signals:
+        return 50.0
+    
+    volatilities = []
+    accuracies = []
+    
+    for ticker in df["_lookup"].unique():
+        signal = ml_signals.get(ticker, {})
+        if signal:
+            if "annual_vol" in signal:
+                volatilities.append(signal["annual_vol"])
+            if "directional_accuracy" in signal:
+                accuracies.append(signal["directional_accuracy"])
+    
+    if not volatilities:
+        return 50.0
+    
+    avg_vol = float(np.mean(volatilities))
+    avg_accuracy = float(np.mean(accuracies)) if accuracies else 0.5
+    
+    vol_score = max(0, 100 * (1 - avg_vol / 1.0))
+    accuracy_score = min(100, 50 + avg_accuracy * 100)
+    
+    market_stability = (vol_score * 0.5 + accuracy_score * 0.5)
+    return float(np.clip(market_stability, 0, 100))
+
+
+def calculate_diversification_score(df: pd.DataFrame) -> float:
+    """
+    Calculates portfolio diversification using Herfindahl index.
+    Returns: 0-100 score (100 = perfectly diversified, 0 = concentrated)
+    """
+    if df.empty or df["Allocation (%)"].sum() == 0:
+        return 0.0
+    
+    allocations = df["Allocation (%)"].values / 100.0
+    hhi = float(np.sum(allocations ** 2))
+    
+    max_holdings = len(df)
+    min_hhi = 1.0 / max_holdings if max_holdings > 0 else 1.0
+    max_hhi = 1.0
+    
+    normalized_hhi = (max_hhi - hhi) / (max_hhi - min_hhi) if max_hhi > min_hhi else 0.0
+    diversification_score = max(0, min(100, normalized_hhi * 100))
+    
+    return float(diversification_score)
+
+
+def calculate_ml_strength_score(ml_signals: dict) -> float:
+    """
+    Scores ML model strength based on:
+    - Number of valid signals
+    - Average directional accuracy
+    - Consistency of predictions
+    Returns: 0-100 score
+    """
+    if not ml_signals:
+        return 30.0
+    
+    valid_signals = [s for s in ml_signals.values() if s and "directional_accuracy" in s]
+    
+    if not valid_signals:
+        return 30.0
+    
+    signal_count_score = min(100, len(valid_signals) * 15)
+    
+    accuracies = [s["directional_accuracy"] for s in valid_signals]
+    avg_accuracy = float(np.mean(accuracies))
+    accuracy_score = (avg_accuracy - 0.5) * 200
+    accuracy_score = float(np.clip(accuracy_score, 0, 100))
+    
+    confidence_values = [s.get("confidence", 50) / 100.0 for s in valid_signals]
+    avg_confidence = float(np.mean(confidence_values))
+    confidence_score = avg_confidence * 100
+    
+    ml_strength = (signal_count_score * 0.3 + accuracy_score * 0.4 + confidence_score * 0.3)
+    return float(np.clip(ml_strength, 0, 100))
+
+
+def calculate_overall_confidence(
+    df: pd.DataFrame,
+    ml_signals: dict,
+    total_value: float,
+    total_invested: float
+) -> dict:
+    """
+    Calculates overall analysis confidence rating.
+    Returns: dict with confidence score (0-100) and component breakdown
+    """
+    if df.empty or total_value == 0:
+        return {
+            "score": 0.0,
+            "data_quality": 0.0,
+            "market_stability": 50.0,
+            "diversification": 0.0,
+            "ml_strength": 30.0,
+            "interpretation": "Insufficient data"
+        }
+    
+    data_quality = calculate_data_quality_score(df, ml_signals)
+    market_stability = calculate_market_stability_score(df, ml_signals)
+    diversification = calculate_diversification_score(df)
+    ml_strength = calculate_ml_strength_score(ml_signals)
+    
+    overall_confidence = (
+        data_quality * 0.25 +
+        market_stability * 0.25 +
+        diversification * 0.25 +
+        ml_strength * 0.25
+    )
+    
+    if overall_confidence >= 75:
+        interpretation = "High confidence — data is comprehensive and portfolio is well-positioned"
+    elif overall_confidence >= 55:
+        interpretation = "Moderate confidence — sufficient data but some limitations exist"
+    else:
+        interpretation = "Low confidence — limited data or high volatility; recommendations are preliminary"
+    
+    return {
+        "score": float(np.clip(overall_confidence, 0, 100)),
+        "data_quality": float(data_quality),
+        "market_stability": float(market_stability),
+        "diversification": float(diversification),
+        "ml_strength": float(ml_strength),
+        "interpretation": interpretation
+    }
+
+
 @st.cache_data(ttl=1800, show_spinner=False)
 def fetch_ml_signals(tickers_with_suffix: list[str]) -> dict:
+    """
+    Computes ML-based directional forecasts for each ticker using a
+    RandomForestClassifier trained on rich technical indicators:
+      RSI-14, MACD, MACD histogram, Bollinger Band position,
+      EMA20/EMA50 crossover, ATR-14, OBV, volume ratio,
+      1d/5d/10d/20d returns, 10d/20d volatility.
+    Confidence = predict_proba (probability of the predicted direction).
+    """
+    def _ema(series, span):
+        return series.ewm(span=span, adjust=False).mean()
+
+    def _rsi(close, period=14):
+        delta = close.diff()
+        gain  = delta.clip(lower=0).rolling(period).mean()
+        loss  = (-delta.clip(upper=0)).rolling(period).mean()
+        rs    = gain / loss.replace(0, np.nan)
+        return 100 - 100 / (1 + rs)
+
+    def _atr(high, low, close, period=14):
+        tr = pd.concat([
+            high - low,
+            (high - close.shift()).abs(),
+            (low  - close.shift()).abs(),
+        ], axis=1).max(axis=1)
+        return tr.rolling(period).mean()
+
+    def _bollinger_pos(close, period=20, n_std=2):
+        """Position within Bollinger Bands: 0 = lower band, 1 = upper band."""
+        mid   = close.rolling(period).mean()
+        std   = close.rolling(period).std()
+        upper = mid + n_std * std
+        lower = mid - n_std * std
+        width = (upper - lower).replace(0, np.nan)
+        return (close - lower) / width
+
     signals = {}
     for symbol in tickers_with_suffix:
         try:
-            hist = yf.Ticker(symbol).history(period="2y", interval="1d")
+            ticker_obj = yf.Ticker(symbol)
+            hist = ticker_obj.history(period="2y", interval="1d")
+
+            # ── Detect unlisted / no-data vs. thin-data ──
             if hist is None or hist.empty or "Close" not in hist.columns:
-                signals[symbol] = {}
+                signals[symbol] = {"status": "no_data"}   # private / unlisted
                 continue
 
-            close = hist["Close"].dropna()
+            close  = hist["Close"].dropna()
+            volume = hist["Volume"] if "Volume" in hist.columns else pd.Series(dtype=float)
+            high   = hist["High"]   if "High"   in hist.columns else close
+            low    = hist["Low"]    if "Low"    in hist.columns else close
+
+            if len(close) < 100:
+                signals[symbol] = {"status": "thin_data", "days": len(close)}
+                continue
+
             returns = close.pct_change()
 
+            # ── Feature engineering ──
+            rsi       = _rsi(close)
+            ema12     = _ema(close, 12)
+            ema26     = _ema(close, 26)
+            macd      = ema12 - ema26
+            macd_sig  = _ema(macd, 9)
+            macd_hist = macd - macd_sig
+            ema20     = _ema(close, 20)
+            ema50     = _ema(close, 50)
+            ema_cross = ema20 / ema50.replace(0, np.nan) - 1   # >0 = golden cross
+            bb_pos    = _bollinger_pos(close)
+            atr       = _atr(high, low, close)
+            atr_pct   = atr / close                             # normalised ATR
+
+            if len(volume.dropna()) > 10:
+                vol_ma    = volume.rolling(20).mean()
+                vol_ratio = volume / vol_ma.replace(0, np.nan)
+            else:
+                vol_ratio = pd.Series(1.0, index=close.index)
+
+            # OBV (On-Balance Volume) momentum
+            obv_delta = np.sign(returns) * volume
+            obv_mom   = obv_delta.rolling(10).sum()
+
             feature_df = pd.DataFrame({
-                "ret_1d": returns,
-                "ret_5d": close.pct_change(5),
-                "ret_10d": close.pct_change(10),
-                "vol_10d": returns.rolling(10).std(),
-                "vol_20d": returns.rolling(20).std(),
-                "mom_20d": close / close.rolling(20).mean() - 1,
-            })
-            target = returns.shift(-1).rename("target_next_day")
+                "ret_1d":    returns,
+                "ret_5d":    close.pct_change(5),
+                "ret_10d":   close.pct_change(10),
+                "ret_20d":   close.pct_change(20),
+                "vol_10d":   returns.rolling(10).std(),
+                "vol_20d":   returns.rolling(20).std(),
+                "rsi":       rsi,
+                "macd":      macd,
+                "macd_hist": macd_hist,
+                "ema_cross": ema_cross,
+                "bb_pos":    bb_pos,
+                "atr_pct":   atr_pct,
+                "vol_ratio": vol_ratio,
+                "obv_mom":   obv_mom,
+            }, index=close.index)
+
+            # Target: 1 if next-day return > 0, else 0 (classification)
+            target = (returns.shift(-1) > 0).astype(int).rename("target")
             model_df = pd.concat([feature_df, target], axis=1).dropna()
 
-            if len(model_df) < 120:
-                signals[symbol] = {}
+            if len(model_df) < 100:
+                signals[symbol] = {"status": "thin_data", "days": len(model_df)}
                 continue
 
-            split_idx = int(len(model_df) * 0.8)
-            train_df = model_df.iloc[:split_idx]
-            test_df = model_df.iloc[split_idx:]
-            if test_df.empty:
-                signals[symbol] = {}
-                continue
+            X = model_df.drop(columns=["target"]).to_numpy(dtype=float)
+            y = model_df["target"].to_numpy(dtype=int)
 
-            X_train = train_df.drop(columns=["target_next_day"]).to_numpy(dtype=float)
-            y_train = train_df["target_next_day"].to_numpy(dtype=float)
-            X_test = test_df.drop(columns=["target_next_day"]).to_numpy(dtype=float)
-            y_test = test_df["target_next_day"].to_numpy(dtype=float)
-            x_latest = model_df.drop(columns=["target_next_day"]).iloc[-1].to_numpy(dtype=float)
+            # ── Time-series cross-validation ──
+            tscv    = TimeSeriesSplit(n_splits=5)
+            da_list = []   # directional accuracy per fold
+            pb_list = []   # probability of predicted class per fold
 
-            X_train_i = np.column_stack([np.ones(len(X_train)), X_train])
-            X_test_i = np.column_stack([np.ones(len(X_test)), X_test])
-            x_latest_i = np.concatenate([[1.0], x_latest])
-
-            ridge_lambda = 1e-3
-            identity = np.eye(X_train_i.shape[1])
-            identity[0, 0] = 0
-            weights = np.linalg.solve(
-                X_train_i.T @ X_train_i + ridge_lambda * identity,
-                X_train_i.T @ y_train
+            scaler = StandardScaler()
+            rf     = RandomForestClassifier(
+                n_estimators=120,
+                max_depth=6,
+                min_samples_leaf=10,
+                random_state=42,
+                n_jobs=-1,
             )
 
-            pred_test = X_test_i @ weights
-            pred_next_day = float(x_latest_i @ weights)
-            pred_5d = (1 + pred_next_day) ** 5 - 1
-            annual_vol = float(returns.dropna().std() * np.sqrt(252))
-            directional_accuracy = float(np.mean(np.sign(pred_test) == np.sign(y_test)))
-            confidence = float(np.clip((directional_accuracy - 0.45) / 0.25, 0, 1) * 100)
+            for train_idx, test_idx in tscv.split(X):
+                X_tr, X_te = X[train_idx], X[test_idx]
+                y_tr, y_te = y[train_idx], y[test_idx]
+                if len(np.unique(y_tr)) < 2:
+                    continue   # skip degenerate fold
+                X_tr_s = scaler.fit_transform(X_tr)
+                X_te_s = scaler.transform(X_te)
+                rf.fit(X_tr_s, y_tr)
+                preds  = rf.predict(X_te_s)
+                probas = rf.predict_proba(X_te_s)
+                da_list.append(float(np.mean(preds == y_te)))
+                # confidence = average probability of the predicted class
+                pb_list.append(float(np.mean(probas[np.arange(len(preds)), preds])))
 
-            if annual_vol < 0.2:
+            if not da_list:
+                signals[symbol] = {"status": "thin_data", "days": len(model_df)}
+                continue
+
+            directional_accuracy = float(np.mean(da_list))
+            avg_prob             = float(np.mean(pb_list))
+            # Confidence: how far above 50% (random) the avg probability is,
+            # scaled so 50% prob → 0% confidence, 75% prob → 100% confidence
+            confidence = float(np.clip((avg_prob - 0.50) / 0.25, 0, 1) * 100)
+
+            # ── Final prediction on latest data ──
+            X_all_s   = scaler.fit_transform(X)
+            rf.fit(X_all_s, y)
+            x_latest  = X[-1].reshape(1, -1)
+            x_latest_s = scaler.transform(x_latest)
+            pred_dir   = int(rf.predict(x_latest_s)[0])
+            pred_prob  = float(rf.predict_proba(x_latest_s)[0][pred_dir])
+
+            # Sign-and-magnitude: use recent volatility to estimate magnitude
+            annual_vol    = float(returns.dropna().std() * np.sqrt(252))
+            daily_vol     = annual_vol / np.sqrt(252)
+            pred_next_day = (1 if pred_dir == 1 else -1) * daily_vol * pred_prob
+            pred_5d       = (1 + pred_next_day) ** 5 - 1
+
+            if annual_vol < 0.20:
                 risk_band = "Low"
             elif annual_vol < 0.35:
                 risk_band = "Medium"
             else:
                 risk_band = "High"
 
+            # Top-3 feature importances (human-readable)
+            feat_names   = list(feature_df.columns)
+            importances  = rf.feature_importances_
+            top_feats    = sorted(zip(feat_names, importances), key=lambda x: -x[1])[:3]
+            top_feat_str = ", ".join(f"{n} ({v:.0%})" for n, v in top_feats)
+
             signals[symbol] = {
-                "pred_next_day": pred_next_day,
-                "pred_5d": float(pred_5d),
-                "annual_vol": annual_vol,
+                "status":               "ok",
+                "pred_next_day":        pred_next_day,
+                "pred_5d":              float(pred_5d),
+                "annual_vol":           annual_vol,
                 "directional_accuracy": directional_accuracy,
-                "confidence": confidence,
-                "risk_band": risk_band,
+                "confidence":           confidence,
+                "risk_band":            risk_band,
+                "top_features":         top_feat_str,
+                "avg_prob":             avg_prob,
             }
         except Exception:
-            signals[symbol] = {}
+            signals[symbol] = {"status": "error"}
     return signals
 
 
@@ -438,7 +787,13 @@ df["Current Price"] = df["_lookup"].map(raw_prices)
 
 failed = df[df["Current Price"].isna()]["Ticker"].tolist()
 if failed:
-    st.warning(f"⚠️ Yahoo Finance has no current data for: {', '.join(failed)}. They are excluded from analysis.")
+    # Hint that some might be private/unlisted rather than just a bad ticker
+    private_hint = " Some of these may be private/unlisted companies (e.g. Lenskart, Zepto) that have no stock exchange listing — those cannot be analysed with market data." if len(failed) > 0 else ""
+    st.warning(
+        f"⚠️ Could not fetch market data for: {', '.join(failed)}. "
+        f"They have been excluded from the analysis."
+        f"{private_hint}"
+    )
 
 df = df.dropna(subset=["Current Price"])
 if df.empty:
@@ -461,14 +816,18 @@ df["Allocation (%)"] = (df["Current Value"] / total_value * 100).round(2)
 with st.spinner("🧠 Running ML forecast model..."):
     ml_signals = fetch_ml_signals(df["_lookup"].drop_duplicates().tolist())
 
+with st.spinner("📊 Computing analysis confidence..."):
+    confidence_data = calculate_overall_confidence(df, ml_signals, total_value, total_invested)
+
 base_currency = "INR" if "NSE" in market else "USD"
 target_currency = "USD" if base_currency == "INR" else "INR"
 target_symbol = "$" if target_currency == "USD" else "₹"
 exchange_rate = None
 
 exchange_rate_api_key = (
-    os.getenv("EXCHANGERATE_API_KEY")
-    or st.secrets.get("EXCHANGERATE_API_KEY", "")
+    manual_exchange_key.strip()
+    or os.getenv("EXCHANGERATE_API_KEY")
+    or safe_secret_get("EXCHANGERATE_API_KEY", "")
 )
 
 if exchange_rate_api_key:
@@ -515,6 +874,11 @@ if exchange_rate:
 st.markdown("<br>", unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────
+# AI Confidence Rating shown after Gemini responds
+# ─────────────────────────────────────────────
+# (Gemini self-assesses its confidence as part of its JSON response — see Gemini section below)
+
+# ─────────────────────────────────────────────
 # Charts
 # ─────────────────────────────────────────────
 ch1, ch2 = st.columns(2)
@@ -548,41 +912,6 @@ with ch2:
     )
     st.plotly_chart(fig_bar, use_container_width=True)
 
-# ─────────────────────────────────────────────
-# ML Forecast Signals
-# ─────────────────────────────────────────────
-st.markdown('<div class="section-title">ML Forecast Signals (Experimental)</div>', unsafe_allow_html=True)
-
-ml_rows = []
-for _, row in df.drop_duplicates(subset=["_lookup"])[["Ticker", "_lookup"]].iterrows():
-    signal = ml_signals.get(row["_lookup"], {})
-    if not signal:
-        continue
-    ml_rows.append({
-        "Ticker": row["Ticker"],
-        "Predicted Next Day Return": signal["pred_next_day"],
-        "Predicted 5D Return": signal["pred_5d"],
-        "Annualized Volatility": signal["annual_vol"],
-        "Directional Accuracy": signal["directional_accuracy"],
-        "Model Confidence": signal["confidence"] / 100.0,
-        "Risk Band": signal["risk_band"],
-    })
-
-if ml_rows:
-    ml_df = pd.DataFrame(ml_rows)
-    st.dataframe(
-        ml_df.style.format({
-            "Predicted Next Day Return": "{:+.2%}",
-            "Predicted 5D Return": "{:+.2%}",
-            "Annualized Volatility": "{:.2%}",
-            "Directional Accuracy": "{:.1%}",
-            "Model Confidence": "{:.1%}",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
-else:
-    st.caption("Not enough historical data to train ML forecasts for the current tickers.")
 
 # ─────────────────────────────────────────────
 # Holdings Table
@@ -658,11 +987,13 @@ if analyze_btn:
 
             q_revenue_text = f"{format_compact_number(q_revenue)} ({q_revenue_growth:.1f}% QoQ)" if q_revenue is not None and q_revenue_growth is not None else format_compact_number(q_revenue)
             q_income_text = f"{format_compact_number(q_income)} ({q_income_growth:.1f}% QoQ)" if q_income is not None and q_income_growth is not None else format_compact_number(q_income)
-            signal = ml_signals.get(lookup_symbol, {})
-            ml_next_day = f"{signal.get('pred_next_day', 0):+.2%}" if signal else "N/A"
-            ml_5d = f"{signal.get('pred_5d', 0):+.2%}" if signal else "N/A"
-            ml_confidence = f"{signal.get('confidence', 0):.1f}%" if signal else "N/A"
-            ml_risk = signal.get("risk_band", "N/A") if signal else "N/A"
+            signal      = ml_signals.get(lookup_symbol, {})
+            ok          = signal.get("status") == "ok"
+            ml_next_day = f"{signal.get('pred_next_day', 0):+.2%}" if ok else "N/A"
+            ml_5d       = f"{signal.get('pred_5d', 0):+.2%}"       if ok else "N/A"
+            ml_confidence = f"{signal.get('confidence', 0):.0f}% (prob {signal.get('avg_prob', 0):.0%})" if ok else "N/A"
+            ml_risk     = signal.get("risk_band", "N/A")            if ok else "N/A"
+            ml_drivers  = signal.get("top_features", "N/A")         if ok else "N/A"
 
             headlines = item.get("headlines") or ["No recent headlines available."]
             headlines_text = "\n".join([f"  - {h}" for h in headlines])
@@ -672,10 +1003,12 @@ if analyze_btn:
 - Sector: {sector} | Market Cap: {market_cap} | P/E: {trailing_pe_text}
 - Revenue Growth (YoY): {revenue_growth_text} | Earnings Growth (YoY): {earnings_growth_text}
 - Latest Quarter Revenue: {q_revenue_text} | Net Income: {q_income_text}
-- ML forecast: Next day {ml_next_day}, 5-day {ml_5d}, confidence {ml_confidence}, risk {ml_risk}
+- ML forecast (Random Forest, 14 indicators): Next day {ml_next_day}, 5-day {ml_5d}, confidence {ml_confidence}, risk {ml_risk}
+- ML key drivers: {ml_drivers}
 - Recent headlines:
 {headlines_text}"""
             )
+
 
         market_context_text = "\n\n".join(context_blocks)
 
@@ -694,44 +1027,219 @@ Holdings:
 Additional market context for top holdings (recent headlines + financial fundamentals):
 {market_context_text}
 
-Use the ML forecast signals as a quantitative prior, but explicitly mention uncertainty and avoid overconfidence.
+Use the ML forecast signals as a quantitative prior, but mention uncertainty where appropriate.
 
-Structure your response exactly as follows, using these headings:
+Structure your entire response in clean, readable Markdown using EXACTLY these sections in this order:
 
-### 1. Risk Profile
+## 1. Risk Profile
 What type of investor does this portfolio suggest? (aggressive / moderate / conservative). Justify with numbers.
 
-### 2. Concentration Risk
+## 2. Concentration Risk
 Are any single stocks over-weighted? Any dangerous bets?
 
-### 3. Top Performers & Laggards
+## 3. Top Performers & Laggards
 What's working? What isn't? Why might that be?
 
-### 4. Rebalancing Recommendations
+## 4. Rebalancing Recommendations
 Give 2–3 specific, actionable suggestions (e.g., trim X, add Y, exit Z). Use allocation percentages.
 
-### 5. Diversification Gaps
+## 5. Diversification Gaps
 What sectors or asset types are missing for a balanced HNI portfolio?
 
-### 6. Overall Verdict
+## 6. Overall Verdict
 One crisp paragraph: summary + single most important action the investor should take today.
+
+After section 6, on its own line, output EXACTLY this format (do not omit it):
+CONFIDENCE_SCORE: <integer 0-100>
+CONFIDENCE_REASON: <one or two sentences on why you are that confident>
 
 Be direct, use the actual numbers, and write for a sophisticated investor who doesn't need hand-holding."""
 
-        with st.spinner("Gemini is analyzing your portfolio..."):
-            try:
-                analysis, model_name = generate_with_retry(api_key, prompt)
+
+        # ── Build a dynamic, factually-accurate step list ──────────────────────
+        # Every step references real data that was actually computed above.
+        ANALYSIS_STEPS = []
+
+        # Phase 1 – Setup
+        ANALYSIS_STEPS.append(("🔗", "Connecting to Gemini AI..."))
+        ANALYSIS_STEPS.append(("📂", f"Loading portfolio: {len(df)} holding{'s' if len(df) != 1 else ''} "
+                                      f"— total value {currency}{total_value:,.0f}"))
+
+        # Phase 2 – Per-stock portfolio review (one step per ticker)
+        for _, row in df.iterrows():
+            ret_str = f"{row['Return (%)']:+.1f}%"
+            alloc_str = f"{row['Allocation (%)']:.1f}%"
+            ANALYSIS_STEPS.append((
+                "📈",
+                f"Reviewing {row['Ticker']}: price {currency}{row['Current Price']:.2f} "
+                f"| return {ret_str} | allocation {alloc_str}"
+            ))
+
+        # Phase 3 – ML signal review (one step per ticker)
+        for _, row in df.drop_duplicates(subset=["_lookup"]).iterrows():
+            signal = ml_signals.get(row["_lookup"], {})
+            if signal:
+                risk  = signal.get("risk_band", "N/A")
+                dacc  = signal.get("directional_accuracy", 0)
+                conf  = signal.get("confidence", 0)
+                vol   = signal.get("annual_vol", 0)
+                # Show a plain-English confidence label instead of a misleading 0%
+                if conf >= 60:
+                    conf_text = f"{conf:.0f}% model confidence"
+                elif conf >= 20:
+                    conf_text = f"low confidence ({conf:.0f}%)"
+                else:
+                    conf_text = "no directional edge (model at or below random chance)"
+                ANALYSIS_STEPS.append((
+                    "🤖",
+                    f"ML signals for {row['Ticker']}: {risk} risk | "
+                    f"{dacc:.0%} directional accuracy | {conf_text} | "
+                    f"{vol:.0%} annual volatility"
+                ))
+            else:
+                ANALYSIS_STEPS.append((
+                    "🤖",
+                    f"ML signals for {row['Ticker']}: no price data available — "
+                    "this ticker may be unlisted or private; Gemini will use fundamentals only"
+                ))
+
+        # Phase 4 – News review (one step per top holding)
+        for _, row in top_holdings.iterrows():
+            item      = market_context.get(row["_lookup"], {})
+            company   = item.get("company_name") or row["Ticker"]
+            headlines = item.get("headlines") or []
+            n         = len(headlines)
+            if n > 0:
+                ANALYSIS_STEPS.append((
+                    "📰",
+                    f"Reviewed {n} recent headline{'s' if n != 1 else ''} for {company} "
+                    f"({row['Ticker']}) — {row['Allocation (%)']:.1f}% of portfolio"
+                ))
+            else:
+                ANALYSIS_STEPS.append((
+                    "📰",
+                    f"Checking market news & sentiment for {company} ({row['Ticker']}) "
+                    f"— {row['Allocation (%)']:.1f}% of portfolio"
+                ))
+
+        # Phase 5 – Fundamentals review (one step per top holding)
+        for _, row in top_holdings.iterrows():
+            item    = market_context.get(row["_lookup"], {})
+            company = item.get("company_name") or row["Ticker"]
+            sector  = item.get("sector") or "N/A"
+            pe      = item.get("trailing_pe")
+            pe_text = f"P/E {float(pe):.1f}" if pe is not None else "P/E unavailable"
+            mcap    = format_compact_number(item.get("market_cap"))
+            ANALYSIS_STEPS.append((
+                "📡",
+                f"Fundamentals for {company}: {sector} sector | {pe_text} | Mkt cap {mcap}"
+            ))
+
+        # Phase 6 – Cross-referencing ML vs. news sentiment
+        ANALYSIS_STEPS.append(("🔄", "Cross-referencing ML forecasts against recent headline sentiment..."))
+        ANALYSIS_STEPS.append(("📊", "Calculating effective sector exposure across all holdings..."))
+
+        # Phase 7 – Gemini reasoning (these all happen inside the Gemini call)
+        ANALYSIS_STEPS.append(("⚠️", "Gemini: identifying concentration risks and over-weighted positions..."))
+        ANALYSIS_STEPS.append(("🏆", "Gemini: ranking top performers and analysing what's driving returns..."))
+        ANALYSIS_STEPS.append(("🩸", "Gemini: diagnosing laggards — market conditions, sector headwinds, or entry-price errors?"))
+        ANALYSIS_STEPS.append(("💡", "Gemini: drafting specific rebalancing recommendations with allocation percentages..."))
+        ANALYSIS_STEPS.append(("🔍", "Gemini: identifying missing sectors and asset classes for a balanced HNI portfolio..."))
+        ANALYSIS_STEPS.append(("✍️", "Gemini: writing the overall verdict and the single most important action to take today..."))
+        ANALYSIS_STEPS.append(("🎯", "Gemini: self-assessing confidence in the advice based on data completeness..."))
+        ANALYSIS_STEPS.append(("📋", "Formatting and finalising the analysis report..."))
+
+        # ~2.2 s per step — for a 62-second response, ~28 steps × 2.2 s ≈ 62 s
+        STEP_DURATION = 2.2
+
+
+        def _collect_full_response(ak, pr):
+            """Runs in a background thread: streams Gemini and returns (full_text, model_name)."""
+            gen, mname = stream_with_retry(ak, pr)
+            return "".join(gen), mname
+
+        try:
+            status_box = st.empty()
+
+            # Start the Gemini call in a background thread
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(_collect_full_response, api_key, prompt)
+
+                step_idx = 0
+                while not future.done():
+                    icon, msg = ANALYSIS_STEPS[min(step_idx, len(ANALYSIS_STEPS) - 1)]
+                    status_box.markdown(
+                        f"""
+                        <div style="
+                            background: linear-gradient(135deg, #1e3a5f 0%, #0f2744 100%);
+                            border-left: 4px solid #3b82f6;
+                            border-radius: 8px;
+                            padding: 18px 22px;
+                            margin: 8px 0;
+                            display: flex;
+                            align-items: center;
+                            gap: 14px;
+                        ">
+                            <span style="font-size:1.8em; line-height:1">{icon}</span>
+                            <div>
+                                <div style="color:#93c5fd; font-size:0.75em; font-weight:600; letter-spacing:0.08em; text-transform:uppercase; margin-bottom:2px">Gemini AI &bull; Working</div>
+                                <div style="color:#f1f5f9; font-size:1em; font-weight:500">{msg}</div>
+                            </div>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+                    # Poll every 0.1s so we react quickly when Gemini finishes
+                    for _ in range(int(STEP_DURATION / 0.1)):
+                        if future.done():
+                            break
+                        time.sleep(0.1)
+                    step_idx += 1
+
+                full_text, model_name = future.result()  # raises if the thread threw
+
+            status_box.empty()
+
+            # ── Render the analysis section ──
+            st.markdown("---")
+            st.markdown('<div class="section-title">🤖 Gemini AI Analysis</div>', unsafe_allow_html=True)
+            st.caption(f"Model used: {model_name.replace('models/', '')}")
+
+            # ── Strip machine-readable confidence lines before displaying ──
+            score_match  = re.search(r"CONFIDENCE_SCORE:\s*(\d+)", full_text)
+            reason_match = re.search(r"CONFIDENCE_REASON:\s*(.+?)(?:\n|$)", full_text)
+            clean_text   = re.sub(r"\n*CONFIDENCE_SCORE:.*", "", full_text, flags=re.DOTALL).strip()
+
+            st.markdown(clean_text)
+
+            # ── Confidence widget — shown ONCE, below the advice ──
+            if score_match:
+                ai_confidence_score  = int(score_match.group(1))
+                ai_confidence_reason = reason_match.group(1).strip() if reason_match else ""
 
                 st.markdown("---")
-                st.markdown('<div class="section-title">🤖 Gemini AI Analysis</div>', unsafe_allow_html=True)
-                st.caption(f"Model used: {model_name.replace('models/', '')}")
-                st.markdown(f'<div class="ai-box">{analysis}</div>', unsafe_allow_html=True)
+                st.markdown('<div class="section-title">🎯 AI Confidence in This Advice</div>', unsafe_allow_html=True)
+                st.caption("Gemini's own assessment of how confident it is in the advice above.")
 
-            except PermissionDenied:
-                st.error("❌ Invalid API key. Please check and try again.")
-            except ResourceExhausted:
-                st.error("⏳ Rate limit hit on current free quota. Please wait a bit and try again.")
-            except GoogleAPICallError as e:
-                st.error(f"❌ Google API error: {e}")
-            except Exception as e:
-                st.error(f"❌ API error: {e}")
+                if ai_confidence_score >= 75:
+                    st.metric(label="HIGH CONFIDENCE", value=f"{ai_confidence_score}%")
+                    if ai_confidence_reason:
+                        st.success(f"💡 {ai_confidence_reason}")
+                elif ai_confidence_score >= 50:
+                    st.metric(label="MODERATE CONFIDENCE", value=f"{ai_confidence_score}%")
+                    if ai_confidence_reason:
+                        st.warning(f"💡 {ai_confidence_reason}")
+                else:
+                    st.metric(label="LOW CONFIDENCE", value=f"{ai_confidence_score}%")
+                    if ai_confidence_reason:
+                        st.error(f"💡 {ai_confidence_reason}")
+
+        except PermissionDenied:
+            st.error("❌ Invalid API key. Please check and try again.")
+        except ResourceExhausted:
+            st.error("⏳ Rate limit hit on current free quota. Please wait a bit and try again.")
+        except GoogleAPICallError as e:
+            st.error(f"❌ Google API error: {e}")
+        except Exception as e:
+            st.error(f"❌ API error: {e}")
+
