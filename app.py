@@ -260,8 +260,24 @@ with st.sidebar:
         currency = "$"
         suffix = ""
 
+    # State initialization
+    if "portfolio_df" not in st.session_state or st.session_state.get("market") != market:
+        st.session_state.portfolio_df = default_df.copy()
+        st.session_state.market = market
+        st.session_state.deleted_rows = []
+
+    # Undo Button UI
+    if st.session_state.deleted_rows:
+        if st.button(f"↩️ Undo Delete ({len(st.session_state.deleted_rows)} available)"):
+            last_deleted = st.session_state.deleted_rows.pop()
+            st.session_state.portfolio_df = pd.concat([st.session_state.portfolio_df, last_deleted], ignore_index=True)
+            st.rerun()
+
+    # Dynamic key ensures editor re-mounts when we programmatically add/drop rows
+    editor_key = f"holdings_editor_{len(st.session_state.portfolio_df)}"
+
     edited_df = st.data_editor(
-        default_df,
+        st.session_state.portfolio_df,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
@@ -269,13 +285,29 @@ with st.sidebar:
             "Avg Buy Price": st.column_config.NumberColumn(f"Avg Buy Price ({currency})", format=f"{currency}%.2f"),
             "Shares": st.column_config.NumberColumn("Shares", format="%d"),
         },
-        key="holdings_editor",
+        key=editor_key,
     )
     
-    # Filter out rows that the user checked for removal
-    holdings_input = edited_df[~edited_df["Remove"]].drop(columns=["Remove"])
+    # Process deletions
+    removed_mask = edited_df["Remove"] == True
+    if removed_mask.any():
+        # Save the removed rows for Undo
+        removed_rows = edited_df[removed_mask].copy()
+        removed_rows["Remove"] = False
+        st.session_state.deleted_rows.append(removed_rows)
+        
+        # Update state and immediately rerun to remove from UI
+        kept_rows = edited_df[~removed_mask].copy()
+        st.session_state.portfolio_df = kept_rows
+        st.rerun()
+    else:
+        # Persist other manual edits (e.g. typing a new ticker)
+        st.session_state.portfolio_df = edited_df.copy()
+
+    # Final dataframe used for analysis
+    holdings_input = st.session_state.portfolio_df.drop(columns=["Remove"])
     
-    st.caption("💡 **Tip:** Check the **🗑️ box** to remove a stock, or click the empty bottom row to add a new one.")
+    st.caption("💡 **Tip:** Check the **🗑️ box** to instantly remove a stock, or click the empty bottom row to add a new one.")
 
 
     st.markdown("---")
