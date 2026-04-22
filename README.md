@@ -1,9 +1,8 @@
 # 📈 AI Portfolio Advisor
-> Built for Timecell placement drive · Google Gemini API + Streamlit
 
 An AI-powered wealth management tool for analyzing stock portfolios and getting
-actionable insights from Google Gemini. Targeted at HNI (High Net-Worth Individual) clients —
-directly aligned with Timecell's product vision.
+actionable insights from Google Gemini.
+
 
 ---
 
