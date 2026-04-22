@@ -231,99 +231,97 @@ st.markdown("""
 
 
 # ─────────────────────────────────────────────
-# Sidebar — Portfolio Input
+# Main — Portfolio Input
 # ─────────────────────────────────────────────
-with st.sidebar:
-    st.markdown("## ⚙️ Portfolio Setup")
-    st.markdown("---")
+st.markdown("## ⚙️ Portfolio Setup")
+st.markdown("---")
 
-    market = st.radio("Market", ["🇮🇳 NSE (India)", "🇺🇸 US Stocks"], horizontal=True)
+market = st.radio("Market", ["🇮🇳 NSE (India)", "🇺🇸 US Stocks"], horizontal=True)
 
-    if "NSE" in market:
-        st.caption("Use NSE tickers (e.g. RELIANCE, TCS, INFY). `.NS` is added automatically.")
-        default_df = pd.DataFrame({
-            "Remove":          [False, False, False, False, False],
-            "Ticker":          ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"],
-            "Shares":          [10, 5, 8, 15, 20],
-            "Avg Buy Price":   [2800.0, 3500.0, 1600.0, 1700.0, 800.0],
-        })
-        currency = "₹"
-        suffix = ".NS"
-    else:
-        st.caption("Use standard US tickers (e.g. AAPL, MSFT, GOOGL).")
-        default_df = pd.DataFrame({
-            "Remove":          [False, False, False, False, False],
-            "Ticker":          ["AAPL", "MSFT", "GOOGL", "NVDA", "META"],
-            "Shares":          [10, 8, 5, 6, 7],
-            "Avg Buy Price":   [175.0, 380.0, 140.0, 480.0, 340.0],
-        })
-        currency = "$"
-        suffix = ""
+if "NSE" in market:
+    st.caption("Use NSE tickers (e.g. RELIANCE, TCS, INFY). `.NS` is added automatically.")
+    default_df = pd.DataFrame({
+        "Remove":          [False, False, False, False, False],
+        "Ticker":          ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"],
+        "Shares":          [10, 5, 8, 15, 20],
+        "Avg Buy Price":   [2800.0, 3500.0, 1600.0, 1700.0, 800.0],
+    })
+    currency = "₹"
+    suffix = ".NS"
+else:
+    st.caption("Use standard US tickers (e.g. AAPL, MSFT, GOOGL).")
+    default_df = pd.DataFrame({
+        "Remove":          [False, False, False, False, False],
+        "Ticker":          ["AAPL", "MSFT", "GOOGL", "NVDA", "META"],
+        "Shares":          [10, 8, 5, 6, 7],
+        "Avg Buy Price":   [175.0, 380.0, 140.0, 480.0, 340.0],
+    })
+    currency = "$"
+    suffix = ""
 
-    # State initialization
-    if "portfolio_df" not in st.session_state or st.session_state.get("market") != market:
-        st.session_state.portfolio_df = default_df.copy()
-        st.session_state.market = market
-        st.session_state.deleted_rows = []
+# State initialization
+if "portfolio_df" not in st.session_state or st.session_state.get("market") != market:
+    st.session_state.portfolio_df = default_df.copy()
+    st.session_state.market = market
+    st.session_state.deleted_rows = []
 
-    # Undo Button UI
-    if st.session_state.deleted_rows:
-        if st.button(f"↩️ Undo Delete ({len(st.session_state.deleted_rows)} available)"):
-            last_deleted = st.session_state.deleted_rows.pop()
-            st.session_state.portfolio_df = pd.concat([st.session_state.portfolio_df, last_deleted], ignore_index=True)
-            st.rerun()
-
-    # Dynamic key ensures editor re-mounts when we programmatically add/drop rows
-    editor_key = f"holdings_editor_{len(st.session_state.portfolio_df)}"
-
-    edited_df = st.data_editor(
-        st.session_state.portfolio_df,
-        num_rows="dynamic",
-        use_container_width=True,
-        column_config={
-            "Remove": st.column_config.CheckboxColumn("🗑️", default=False),
-            "Avg Buy Price": st.column_config.NumberColumn(f"Avg Buy Price ({currency})", format=f"{currency}%.2f"),
-            "Shares": st.column_config.NumberColumn("Shares", format="%d"),
-        },
-        key=editor_key,
-    )
-    
-    # Process deletions
-    removed_mask = edited_df["Remove"] == True
-    if removed_mask.any():
-        # Save the removed rows for Undo
-        removed_rows = edited_df[removed_mask].copy()
-        removed_rows["Remove"] = False
-        st.session_state.deleted_rows.append(removed_rows)
-        
-        # Update state and immediately rerun to remove from UI
-        kept_rows = edited_df[~removed_mask].copy()
-        st.session_state.portfolio_df = kept_rows
+# Undo Button UI
+if st.session_state.deleted_rows:
+    if st.button(f"↩️ Undo Delete ({len(st.session_state.deleted_rows)} available)"):
+        last_deleted = st.session_state.deleted_rows.pop()
+        st.session_state.portfolio_df = pd.concat([st.session_state.portfolio_df, last_deleted], ignore_index=True)
         st.rerun()
-    else:
-        # Persist other manual edits (e.g. typing a new ticker)
-        st.session_state.portfolio_df = edited_df.copy()
 
-    # Final dataframe used for analysis
-    holdings_input = st.session_state.portfolio_df.drop(columns=["Remove"])
+# Dynamic key ensures editor re-mounts when we programmatically add/drop rows
+editor_key = f"holdings_editor_{len(st.session_state.portfolio_df)}"
+
+edited_df = st.data_editor(
+    st.session_state.portfolio_df,
+    num_rows="dynamic",
+    use_container_width=True,
+    column_config={
+        "Remove": st.column_config.CheckboxColumn("🗑️", default=False),
+        "Avg Buy Price": st.column_config.NumberColumn(f"Avg Buy Price ({currency})", format=f"{currency}%.2f"),
+        "Shares": st.column_config.NumberColumn("Shares", format="%d"),
+    },
+    key=editor_key,
+)
+
+# Process deletions
+removed_mask = edited_df["Remove"] == True
+if removed_mask.any():
+    # Save the removed rows for Undo
+    removed_rows = edited_df[removed_mask].copy()
+    removed_rows["Remove"] = False
+    st.session_state.deleted_rows.append(removed_rows)
     
-    st.caption("💡 **Tip:** Check the **🗑️ box** to instantly remove a stock, or click the empty bottom row to add a new one.")
+    # Update state and immediately rerun to remove from UI
+    kept_rows = edited_df[~removed_mask].copy()
+    st.session_state.portfolio_df = kept_rows
+    st.rerun()
+
+# We do NOT overwrite st.session_state.portfolio_df for normal typing edits!
+# Overwriting it constantly fights with Streamlit's internal cache and blanks cells.
+
+# Final dataframe used for analysis directly from the editor's output
+holdings_input = edited_df.drop(columns=["Remove"])
+
+st.caption("💡 **Tip:** Check the **🗑️ box** to instantly remove a stock, or click the empty bottom row to add a new one.")
 
 
-    st.markdown("---")
+st.markdown("---")
 
-    configured_api_key = (
-        os.getenv("GOOGLE_API_KEY")
-        or os.getenv("GEMINI_API_KEY")
-        or safe_secret_get("GOOGLE_API_KEY", "")
-        or safe_secret_get("GEMINI_API_KEY", "")
-    )
+configured_api_key = (
+    os.getenv("GOOGLE_API_KEY")
+    or os.getenv("GEMINI_API_KEY")
+    or safe_secret_get("GOOGLE_API_KEY", "")
+    or safe_secret_get("GEMINI_API_KEY", "")
+)
 
-    api_key = configured_api_key
-    analyze_btn = st.button("🤖 Analyze with Gemini AI")
+api_key = configured_api_key
+analyze_btn = st.button("🤖 Analyze with Gemini AI")
 
-    st.markdown("---")
-    st.caption("Google Gemini API")
+st.markdown("---")
 
 
 # ─────────────────────────────────────────────
@@ -334,11 +332,26 @@ def fetch_prices(tickers_with_suffix: list[str]) -> dict:
     results = {}
     for t in tickers_with_suffix:
         try:
-            hist = yf.Ticker(t).history(period="2d")
+            hist = yf.Ticker(t).history(period="7d")
             results[t] = float(hist["Close"].iloc[-1]) if not hist.empty else None
         except Exception:
             results[t] = None
     return results
+
+def resolve_ticker(query: str) -> str:
+    """Uses Yahoo Finance Search API to find the best official ticker for a given text."""
+    try:
+        url = f"https://query2.finance.yahoo.com/v1/finance/search?q={requests.utils.quote(query)}&quotesCount=1"
+        res = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=5)
+        res.raise_for_status()
+        quotes = res.json().get("quotes", [])
+        if quotes:
+            symbol = quotes[0].get("symbol")
+            if symbol:
+                return symbol
+    except Exception:
+        pass
+    return query
 
 
 @st.cache_data(ttl=1800, show_spinner=False)
@@ -374,17 +387,33 @@ def format_compact_number(value) -> str:
     return f"{num:.2f}"
 
 
-def get_quarterly_metrics(ticker: yf.Ticker) -> dict:
-    quarterly = ticker.quarterly_income_stmt
-    if quarterly is None or quarterly.empty:
-        quarterly = ticker.quarterly_financials
-    if quarterly is None or quarterly.empty:
-        return {}
+def classify_market_cap(mc: float, is_nse: bool) -> str:
+    if not mc or np.isnan(mc): return "Unknown"
+    # INR Classification (in Crores: 1 Cr = 10_000_000)
+    if is_nse:
+        if mc > 200_000_000_000: return "Large Cap"
+        if mc > 50_000_000_000: return "Mid Cap"
+        if mc > 5_000_000_000: return "Small Cap"
+        return "Micro Cap"
+    else:
+        # USD Classification
+        if mc > 10_000_000_000: return "Large Cap"
+        if mc > 2_000_000_000: return "Mid Cap"
+        if mc > 300_000_000: return "Small Cap"
+        return "Micro Cap"
 
-    def metric_with_growth(metric_name: str):
-        if metric_name not in quarterly.index:
+
+def get_quarterly_metrics(ticker: yf.Ticker) -> dict:
+    quarterly_is = ticker.quarterly_income_stmt
+    if quarterly_is is None or quarterly_is.empty:
+        quarterly_is = ticker.quarterly_financials
+        
+    quarterly_bs = ticker.quarterly_balance_sheet
+
+    def metric_with_growth(df, metric_name: str):
+        if df is None or df.empty or metric_name not in df.index:
             return None, None
-        series = quarterly.loc[metric_name].dropna()
+        series = df.loc[metric_name].dropna()
         if series.empty:
             return None, None
         latest = float(series.iloc[0])
@@ -392,13 +421,24 @@ def get_quarterly_metrics(ticker: yf.Ticker) -> dict:
         growth = ((latest - previous) / abs(previous) * 100) if previous not in (None, 0) else None
         return latest, growth
 
-    revenue, revenue_growth = metric_with_growth("Total Revenue")
-    net_income, net_income_growth = metric_with_growth("Net Income")
+    revenue, revenue_growth = metric_with_growth(quarterly_is, "Total Revenue")
+    net_income, net_income_growth = metric_with_growth(quarterly_is, "Net Income")
+    
+    total_debt, _ = metric_with_growth(quarterly_bs, "Total Debt")
+    total_equity, _ = metric_with_growth(quarterly_bs, "Stockholders Equity")
+    
+    debt_to_equity = (total_debt / total_equity) if total_debt is not None and total_equity not in (None, 0) else None
+    profit_margin = (net_income / revenue * 100) if net_income is not None and revenue not in (None, 0) else None
+    roe = (net_income / total_equity * 100) if net_income is not None and total_equity not in (None, 0) else None
+
     return {
         "revenue": revenue,
         "revenue_growth": revenue_growth,
         "net_income": net_income,
         "net_income_growth": net_income_growth,
+        "debt_to_equity": debt_to_equity,
+        "profit_margin": profit_margin,
+        "roe": roe,
     }
 
 
@@ -418,10 +458,14 @@ def fetch_market_context(tickers_with_suffix: list[str]) -> dict:
                 publisher = item.get("publisher", "Unknown source")
                 headlines.append(f"{title} ({publisher})")
 
+            mc = info.get("marketCap")
+            cap_tier = classify_market_cap(mc, symbol.endswith(".NS"))
+
             context[symbol] = {
                 "company_name": info.get("shortName") or info.get("longName") or symbol,
                 "sector": info.get("sector"),
-                "market_cap": info.get("marketCap"),
+                "market_cap": mc,
+                "market_cap_tier": cap_tier,
                 "trailing_pe": info.get("trailingPE"),
                 "revenue_growth": info.get("revenueGrowth"),
                 "earnings_growth": info.get("earningsGrowth"),
@@ -805,13 +849,26 @@ if df.empty:
 # Fetch prices
 with st.spinner("📡 Fetching live prices..."):
     raw_prices = fetch_prices(df["_lookup"].tolist())
+    
+    # Smart Ticker Fallback
+    for idx, row in df.iterrows():
+        t = row["_lookup"]
+        if raw_prices.get(t) is None:
+            new_symbol = resolve_ticker(row["Ticker"])
+            if new_symbol and new_symbol != t and new_symbol != row["Ticker"]:
+                fb_price = fetch_prices([new_symbol])
+                if fb_price.get(new_symbol) is not None:
+                    df.at[idx, "_lookup"] = new_symbol
+                    df.at[idx, "Ticker"] = new_symbol.replace(suffix, "") if suffix else new_symbol
+                    raw_prices[new_symbol] = fb_price[new_symbol]
+                    st.toast(f"Auto-resolved '{row['Ticker']}' to '{new_symbol}'", icon="🔍")
 
 df["Current Price"] = df["_lookup"].map(raw_prices)
 
 failed = df[df["Current Price"].isna()]["Ticker"].tolist()
 if failed:
     # Hint that some might be private/unlisted rather than just a bad ticker
-    private_hint = " Some of these may be private/unlisted companies (e.g. Lenskart, Zepto) that have no stock exchange listing — those cannot be analysed with market data." if len(failed) > 0 else ""
+    private_hint = " Some of these may be private/unlisted companies (e.g. Zepto, CRED) that have no stock exchange listing - those cannot be analysed with market data." if len(failed) > 0 else ""
     st.warning(
         f"⚠️ Could not fetch market data for: {', '.join(failed)}. "
         f"They have been excluded from the analysis."
@@ -993,6 +1050,7 @@ if analyze_btn:
             company_name = item.get("company_name") or ticker_symbol
             sector = item.get("sector") or "N/A"
             market_cap = format_compact_number(item.get("market_cap"))
+            cap_tier = item.get("market_cap_tier", "Unknown")
             trailing_pe = item.get("trailing_pe")
             trailing_pe_text = f"{float(trailing_pe):.2f}" if trailing_pe is not None else "N/A"
 
@@ -1006,9 +1064,17 @@ if analyze_btn:
             q_revenue_growth = quarterly.get("revenue_growth")
             q_income = quarterly.get("net_income")
             q_income_growth = quarterly.get("net_income_growth")
+            q_debt_to_equity = quarterly.get("debt_to_equity")
+            q_profit_margin = quarterly.get("profit_margin")
+            q_roe = quarterly.get("roe")
 
             q_revenue_text = f"{format_compact_number(q_revenue)} ({q_revenue_growth:.1f}% QoQ)" if q_revenue is not None and q_revenue_growth is not None else format_compact_number(q_revenue)
             q_income_text = f"{format_compact_number(q_income)} ({q_income_growth:.1f}% QoQ)" if q_income is not None and q_income_growth is not None else format_compact_number(q_income)
+            
+            q_de_text = f"{q_debt_to_equity:.2f}" if q_debt_to_equity is not None else "N/A"
+            q_pm_text = f"{q_profit_margin:.1f}%" if q_profit_margin is not None else "N/A"
+            q_roe_text = f"{q_roe:.1f}%" if q_roe is not None else "N/A"
+
             signal      = ml_signals.get(lookup_symbol, {})
             ok          = signal.get("status") == "ok"
             ml_next_day = f"{signal.get('pred_next_day', 0):+.2%}" if ok else "N/A"
@@ -1022,9 +1088,10 @@ if analyze_btn:
 
             context_blocks.append(
                 f"""{ticker_symbol} ({company_name}) | Allocation: {allocation:.2f}%
-- Sector: {sector} | Market Cap: {market_cap} | P/E: {trailing_pe_text}
+- Sector: {sector} | Market Cap: {market_cap} ({cap_tier}) | P/E: {trailing_pe_text}
 - Revenue Growth (YoY): {revenue_growth_text} | Earnings Growth (YoY): {earnings_growth_text}
 - Latest Quarter Revenue: {q_revenue_text} | Net Income: {q_income_text}
+- Profit Margin: {q_pm_text} | ROE: {q_roe_text} | Debt-to-Equity: {q_de_text}
 - ML forecast (Random Forest, 14 indicators): Next day {ml_next_day}, 5-day {ml_5d}, confidence {ml_confidence}, risk {ml_risk}
 - ML key drivers: {ml_drivers}
 - Recent headlines:
