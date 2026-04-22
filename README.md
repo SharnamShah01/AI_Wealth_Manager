@@ -1,9 +1,8 @@
 # 📈 AI Portfolio Advisor
-> Built for Timecell placement drive · Google Gemini API + Streamlit
 
 An AI-powered wealth management tool for analyzing stock portfolios and getting
-actionable insights from Google Gemini. Targeted at HNI (High Net-Worth Individual) clients —
-directly aligned with Timecell's product vision.
+actionable insights from Google Gemini.
+
 
 ---
 
@@ -93,8 +92,3 @@ EXCHANGERATE_API_KEY = "your_exchangerate_api_key"
 `AAPL`, `MSFT`, `GOOGL`, `NVDA`, `META`, `AMZN`, `TSLA`, `JPM`
 
 ---
-
-## Notes
-- API key: Get yours at https://aistudio.google.com/apikey
-- Prices are cached for 5 minutes to avoid rate limits
-- NSE suffix (`.NS`) is added automatically — just enter the base ticker
