@@ -77,8 +77,3 @@ EXCHANGERATE_API_KEY = "your_exchangerate_api_key"
 `AAPL`, `MSFT`, `GOOGL`, `NVDA`, `META`, `AMZN`, `TSLA`, `JPM`
 
 ---
-
-## Notes
-- API key: Get yours at https://aistudio.google.com/apikey
-- Prices are cached for 5 minutes to avoid rate limits
-- NSE suffix (`.NS`) is added automatically — just enter the base ticker
