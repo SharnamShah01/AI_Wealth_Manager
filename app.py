@@ -271,26 +271,8 @@ with st.sidebar:
 
     st.markdown("---")
 
-    # ⚠️ TODO: REMOVE BEFORE COMMIT — Temporary local testing inputs ⚠️
-    with st.expander("🔑 API Keys (Local Testing Only)", expanded=True):
-        st.caption("⚠️ For local testing only. Leave blank to use Streamlit secrets / environment variables. **Remove this block before committing.**")
-        manual_google_key = st.text_input(
-            "Google Gemini API Key",
-            type="password",
-            placeholder="Paste your GOOGLE_API_KEY here...",
-            key="manual_google_api_key",
-        )
-        manual_exchange_key = st.text_input(
-            "ExchangeRate API Key",
-            type="password",
-            placeholder="Paste your EXCHANGERATE_API_KEY here (optional)...",
-            key="manual_exchange_api_key",
-        )
-    # ⚠️ END TODO ⚠️
-
     configured_api_key = (
-        manual_google_key.strip()
-        or os.getenv("GOOGLE_API_KEY")
+        os.getenv("GOOGLE_API_KEY")
         or os.getenv("GEMINI_API_KEY")
         or safe_secret_get("GOOGLE_API_KEY", "")
         or safe_secret_get("GEMINI_API_KEY", "")
@@ -825,8 +807,7 @@ target_symbol = "$" if target_currency == "USD" else "₹"
 exchange_rate = None
 
 exchange_rate_api_key = (
-    manual_exchange_key.strip()
-    or os.getenv("EXCHANGERATE_API_KEY")
+    os.getenv("EXCHANGERATE_API_KEY")
     or safe_secret_get("EXCHANGERATE_API_KEY", "")
 )
 
