@@ -268,6 +268,8 @@ with st.sidebar:
         },
         key="holdings_editor",
     )
+    st.caption("💡 **Tip:** To delete a stock, click the tiny empty box on the far left edge of the row, then press **Delete** or **Backspace** on your keyboard.")
+
 
     st.markdown("---")
 
