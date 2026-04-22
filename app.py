@@ -333,7 +333,8 @@ def fetch_prices(tickers_with_suffix: list[str]) -> dict:
     for t in tickers_with_suffix:
         try:
             hist = yf.Ticker(t).history(period="7d")
-            results[t] = float(hist["Close"].iloc[-1]) if not hist.empty else None
+            valid_closes = hist["Close"].dropna()
+            results[t] = float(valid_closes.iloc[-1]) if not valid_closes.empty else None
         except Exception:
             results[t] = None
     return results
