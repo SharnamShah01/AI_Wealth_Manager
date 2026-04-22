@@ -242,6 +242,7 @@ with st.sidebar:
     if "NSE" in market:
         st.caption("Use NSE tickers (e.g. RELIANCE, TCS, INFY). `.NS` is added automatically.")
         default_df = pd.DataFrame({
+            "Remove":          [False, False, False, False, False],
             "Ticker":          ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"],
             "Shares":          [10, 5, 8, 15, 20],
             "Avg Buy Price":   [2800.0, 3500.0, 1600.0, 1700.0, 800.0],
@@ -251,6 +252,7 @@ with st.sidebar:
     else:
         st.caption("Use standard US tickers (e.g. AAPL, MSFT, GOOGL).")
         default_df = pd.DataFrame({
+            "Remove":          [False, False, False, False, False],
             "Ticker":          ["AAPL", "MSFT", "GOOGL", "NVDA", "META"],
             "Shares":          [10, 8, 5, 6, 7],
             "Avg Buy Price":   [175.0, 380.0, 140.0, 480.0, 340.0],
@@ -258,17 +260,22 @@ with st.sidebar:
         currency = "$"
         suffix = ""
 
-    holdings_input = st.data_editor(
+    edited_df = st.data_editor(
         default_df,
         num_rows="dynamic",
         use_container_width=True,
         column_config={
+            "Remove": st.column_config.CheckboxColumn("🗑️", default=False),
             "Avg Buy Price": st.column_config.NumberColumn(f"Avg Buy Price ({currency})", format=f"{currency}%.2f"),
             "Shares": st.column_config.NumberColumn("Shares", format="%d"),
         },
         key="holdings_editor",
     )
-    st.caption("💡 **Tip:** To delete a stock, click the tiny empty box on the far left edge of the row, then press **Delete** or **Backspace** on your keyboard.")
+    
+    # Filter out rows that the user checked for removal
+    holdings_input = edited_df[~edited_df["Remove"]].drop(columns=["Remove"])
+    
+    st.caption("💡 **Tip:** Check the **🗑️ box** to remove a stock, or click the empty bottom row to add a new one.")
 
 
     st.markdown("---")
