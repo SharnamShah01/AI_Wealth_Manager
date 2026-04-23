@@ -1116,6 +1116,7 @@ st.dataframe(styled, use_container_width=True, hide_index=True)
 # Gemini AI Analysis
 # ─────────────────────────────────────────────
 if analyze_btn:
+    st.toast("⏳ Analysis started — scroll down to see results!", icon="🤖")
     if not api_key:
         st.error("🔑 Google API key is not configured. Add GOOGLE_API_KEY in Streamlit secrets or environment.")
     else:
@@ -1380,6 +1381,8 @@ Be direct, use the actual numbers, and write for a sophisticated investor who do
 
             # ── Render the analysis section ──
             st.markdown("---")
+            # Named anchor so JS can scroll directly to this element
+            st.markdown('<div id="ai-analysis"></div>', unsafe_allow_html=True)
             st.markdown('<div class="section-title">🤖 Gemini AI Analysis</div>', unsafe_allow_html=True)
             st.caption(f"Model used: {model_name.replace('models/', '')}")
 
@@ -1420,4 +1423,26 @@ Be direct, use the actual numbers, and write for a sophisticated investor who do
             st.error(f"❌ Google API error: {e}")
         except Exception as e:
             st.error(f"❌ API error: {e}")
+
+        # ── Auto-scroll to #ai-analysis anchor ──
+        # This is the most reliable cross-browser approach in Streamlit.
+        # We inject a tiny visible link styled as display:none that navigates
+        # the browser to the anchor we placed at the analysis heading.
+        st.markdown(
+            """
+            <script>
+                // Walk up from the iframe to the parent Streamlit window and
+                // scroll the named anchor into view after a short render delay.
+                setTimeout(function() {
+                    try {
+                        var anchor = window.parent.document.getElementById('ai-analysis');
+                        if (anchor) {
+                            anchor.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                        }
+                    } catch(e) {}
+                }, 300);
+            </script>
+            """,
+            unsafe_allow_html=True,
+        )
 
