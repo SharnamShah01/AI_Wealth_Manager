@@ -1,5 +1,6 @@
 import streamlit as st
 from streamlit.errors import StreamlitSecretNotFoundError
+from streamlit_local_storage import LocalStorage
 import pandas as pd
 import numpy as np
 import plotly.express as px
@@ -17,6 +18,45 @@ from sklearn.model_selection import TimeSeriesSplit
 from sklearn.preprocessing import StandardScaler
 import yfinance as yf
 from datetime import datetime, timedelta
+
+# ─────────────────────────────────────────────────────────────
+# Browser-local storage — persists across refreshes / sessions
+# ─────────────────────────────────────────────────────────────
+_ls = LocalStorage()
+LS_KEY = "ai_wm_portfolio_v1"
+
+def _save_portfolio(df: pd.DataFrame, mkt: str) -> None:
+    """Serialise the portfolio and write it to the browser's LocalStorage."""
+    payload = {
+        "market": mkt,
+        "rows": df.drop(columns=["Remove"], errors="ignore").to_dict(orient="records"),
+    }
+    _ls.setItem(LS_KEY, json.dumps(payload))
+
+def _load_portfolio() -> tuple:
+    """
+    Return (df, market) from LocalStorage.
+    Returns (None, None) if nothing is saved or data is corrupt.
+    """
+    try:
+        raw = _ls.getItem(LS_KEY)
+        if not raw:
+            return None, None
+        payload = json.loads(raw)
+        saved_market = payload.get("market")
+        rows = payload.get("rows", [])
+        if not rows or not saved_market:
+            return None, None
+        loaded = pd.DataFrame(rows)
+        for col in ["Ticker", "Shares", "Avg Buy Price"]:
+            if col not in loaded.columns:
+                return None, None
+        loaded["Remove"] = False
+        loaded["Shares"] = pd.to_numeric(loaded["Shares"], errors="coerce").fillna(0).astype(int)
+        loaded["Avg Buy Price"] = pd.to_numeric(loaded["Avg Buy Price"], errors="coerce").fillna(0.0)
+        return loaded[["Remove", "Ticker", "Shares", "Avg Buy Price"]], saved_market
+    except Exception:
+        return None, None
 
 def safe_secret_get(key: str, default: str = "") -> str:
     try:
@@ -200,6 +240,12 @@ st.markdown("""
         padding-bottom: 6px;
         border-bottom: 2px solid rgba(128, 128, 128, 0.3);
     }
+    
+    /* Hide Streamlit element toolbars (download, search, fullscreen) */
+    [data-testid="stElementToolbar"] {
+        display: none !important;
+    }
+
     .stDataFrame { border-radius: 10px; overflow: hidden; }
     div[data-testid="stSidebar"] { background-color: #0f172a; }
     div[data-testid="stSidebar"] * { color: #e2e8f0 !important; }
@@ -259,20 +305,44 @@ else:
     currency = "$"
     suffix = ""
 
-# State initialization
-if "portfolio_df" not in st.session_state or st.session_state.get("market") != market:
+# ── State initialization & LocalStorage Sync ────────────────────────────────
+if "portfolio_df" not in st.session_state:
+    # First-ever run in this session: start with defaults
     st.session_state.portfolio_df = default_df.copy()
     st.session_state.market = market
     st.session_state.deleted_rows = []
+    st.session_state.ls_synced = False
 
-# Undo Button UI
-if st.session_state.deleted_rows:
-    if st.button(f"↩️ Undo Delete ({len(st.session_state.deleted_rows)} available)"):
-        last_deleted = st.session_state.deleted_rows.pop()
-        st.session_state.portfolio_df = pd.concat([st.session_state.portfolio_df, last_deleted], ignore_index=True)
+# Try to sync from browser LocalStorage if not already done
+if not st.session_state.ls_synced:
+    ls_df, ls_market = _load_portfolio()
+    if ls_df is not None:
+        # Success! Browser has data. Overwrite defaults.
+        st.session_state.portfolio_df = ls_df
+        st.session_state.market = ls_market
+        st.session_state.ls_synced = True
+        st.toast("✅ Portfolio restored from browser storage!", icon="💾")
         st.rerun()
 
-# Dynamic key ensures editor re-mounts when we programmatically add/drop rows
+# If the user manually toggles the Market radio button, reset to that market's defaults
+if st.session_state.get("market") != market:
+    st.session_state.portfolio_df = default_df.copy()
+    st.session_state.market = market
+    st.session_state.deleted_rows = []
+    _save_portfolio(st.session_state.portfolio_df, market)
+    st.session_state.ls_synced = True 
+
+# ── Undo Button ─────────────────────────────────────────────────────────────
+if st.session_state.get("deleted_rows"):
+    if st.button(f"↩️ Undo Delete ({len(st.session_state.deleted_rows)} available)"):
+        last_deleted = st.session_state.deleted_rows.pop()
+        st.session_state.portfolio_df = pd.concat(
+            [st.session_state.portfolio_df, last_deleted], ignore_index=True
+        )
+        _save_portfolio(st.session_state.portfolio_df, market)
+        st.rerun()
+
+# ── Data Editor ──────────────────────────────────────────────────────────────
 editor_key = f"holdings_editor_{len(st.session_state.portfolio_df)}"
 
 edited_df = st.data_editor(
@@ -287,27 +357,33 @@ edited_df = st.data_editor(
     key=editor_key,
 )
 
-# Process deletions
+# ── Process deletions ────────────────────────────────────────────────────────
 removed_mask = edited_df["Remove"] == True
 if removed_mask.any():
-    # Save the removed rows for Undo
     removed_rows = edited_df[removed_mask].copy()
     removed_rows["Remove"] = False
     st.session_state.deleted_rows.append(removed_rows)
-    
-    # Update state and immediately rerun to remove from UI
     kept_rows = edited_df[~removed_mask].copy()
     st.session_state.portfolio_df = kept_rows
+    _save_portfolio(kept_rows, market)
     st.rerun()
 
-# We do NOT overwrite st.session_state.portfolio_df for normal typing edits!
-# Overwriting it constantly fights with Streamlit's internal cache and blanks cells.
-
-# Final dataframe used for analysis directly from the editor's output
 holdings_input = edited_df.drop(columns=["Remove"])
 
-st.caption("💡 **Tip:** Check the **🗑️ box** to instantly remove a stock, or click the empty bottom row to add a new one.")
+# ── Silent Auto-Save ─────────────────────────────────────────────────────────
+# Compare the current editor state to the last saved state to trigger autosaves
+# without mutating st.session_state.portfolio_df (which breaks UI focus)
+current_state_str = edited_df.to_json()
+if "last_saved_state" not in st.session_state:
+    st.session_state.last_saved_state = current_state_str
 
+if current_state_str != st.session_state.last_saved_state:
+    _save_portfolio(edited_df, market)
+    st.session_state.last_saved_state = current_state_str
+    st.session_state.ls_synced = True
+
+st.caption("💡 **Tip:** Check the **🗑️ box** to instantly remove a stock, or click the empty bottom row to add a new one.")
+st.caption("🟢 *Auto-saving in real-time to your browser*")
 
 st.markdown("---")
 
@@ -971,8 +1047,12 @@ with ch1:
         color_discrete_sequence=px.colors.sequential.Blues_r,
     )
     fig_pie.update_traces(textinfo="percent+label", hovertemplate="%{label}: %{value:,.0f}")
-    fig_pie.update_layout(showlegend=False, margin=dict(t=40, b=10, l=10, r=10))
-    st.plotly_chart(fig_pie, use_container_width=True)
+    fig_pie.update_layout(
+        showlegend=False, 
+        margin=dict(t=40, b=10, l=10, r=10),
+        dragmode=False  # Disables dragging/zooming
+    )
+    st.plotly_chart(fig_pie, use_container_width=True, config={'displayModeBar': False})
 
 with ch2:
     df_sorted = df.sort_values("Return (%)")
@@ -986,11 +1066,15 @@ with ch2:
     ))
     fig_bar.update_layout(
         title="Individual Returns (%)",
-        xaxis_title="Stock", yaxis_title="Return (%)",
+        xaxis_title="Stock", 
+        yaxis_title="Return (%)",
         plot_bgcolor="white",
         margin=dict(t=40, b=10, l=10, r=10),
+        dragmode=False,  # Disables box zoom
+        xaxis=dict(fixedrange=True),  # Disables pinch/scroll zoom
+        yaxis=dict(fixedrange=True)
     )
-    st.plotly_chart(fig_bar, use_container_width=True)
+    st.plotly_chart(fig_bar, use_container_width=True, config={'displayModeBar': False})
 
 
 # ─────────────────────────────────────────────
@@ -1035,6 +1119,10 @@ if analyze_btn:
     if not api_key:
         st.error("🔑 Google API key is not configured. Add GOOGLE_API_KEY in Streamlit secrets or environment.")
     else:
+        # Persist any manually typed edits to LocalStorage now
+        _save_portfolio(edited_df, market)
+        st.session_state.ls_synced = True
+
         holdings_text = df[["Ticker", "Shares", "Avg Buy Price", "Current Price",
                              "Current Value", "PnL", "Return (%)", "Allocation (%)"]].to_string(index=False)
         top_holdings = df.sort_values("Allocation (%)", ascending=False).head(5)[["Ticker", "_lookup", "Allocation (%)"]]
