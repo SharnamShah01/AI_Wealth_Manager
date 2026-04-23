@@ -30,9 +30,14 @@ LS_KEY = "ai_wm_portfolio_v1"
 # session_state so that every invocation gets a unique widget key.
 def _save_portfolio(df: pd.DataFrame, mkt: str) -> None:
     """Serialise the portfolio and write it to the browser's LocalStorage."""
+    # We maintain `st.session_state.all_portfolios` = {"NSE": df1, "US": df2}
+    portfolios = st.session_state.get("all_portfolios", {})
+    portfolios[mkt] = df.drop(columns=["Remove"], errors="ignore").to_dict(orient="records")
+    st.session_state.all_portfolios = portfolios
+
     payload = {
-        "market": mkt,
-        "rows": df.drop(columns=["Remove"], errors="ignore").to_dict(orient="records"),
+        "market": mkt, # active market when saved
+        "portfolios": portfolios
     }
     # Increment a per-session counter so every setItem call has a unique key.
     _save_ctr = st.session_state.get("_ls_save_ctr", 0) + 1
@@ -41,28 +46,44 @@ def _save_portfolio(df: pd.DataFrame, mkt: str) -> None:
 
 def _load_portfolio() -> tuple:
     """
-    Return (df, market) from LocalStorage.
-    Returns (None, None) if nothing is saved or data is corrupt.
+    Return a tuple: (saved_dfs_dict, last_active_market).
+    Returns ({}, None) if nothing is saved or data is corrupt.
     """
     try:
         raw = _ls.getItem(LS_KEY)
         if not raw:
-            return None, None
+            return {}, None
         payload = json.loads(raw)
+        
         saved_market = payload.get("market")
-        rows = payload.get("rows", [])
-        if not rows or not saved_market:
-            return None, None
-        loaded = pd.DataFrame(rows)
-        for col in ["Ticker", "Shares", "Avg Buy Price"]:
-            if col not in loaded.columns:
-                return None, None
-        loaded["Remove"] = False
-        loaded["Shares"] = pd.to_numeric(loaded["Shares"], errors="coerce").fillna(0).astype(int)
-        loaded["Avg Buy Price"] = pd.to_numeric(loaded["Avg Buy Price"], errors="coerce").fillna(0.0)
-        return loaded[["Remove", "Ticker", "Shares", "Avg Buy Price"]], saved_market
+        portfolios = payload.get("portfolios")
+        
+        result_dfs = {}
+        
+        # Backward compatibility: old format {"market": mkt, "rows": [...]}
+        if not portfolios and "rows" in payload:
+            m = payload.get("market")
+            df = pd.DataFrame(payload["rows"])
+            if not df.empty:
+                df["Remove"] = False
+                df["Shares"] = pd.to_numeric(df["Shares"], errors="coerce").fillna(0).astype(int)
+                df["Avg Buy Price"] = pd.to_numeric(df["Avg Buy Price"], errors="coerce").fillna(0.0)
+                result_dfs[m] = df[["Remove", "Ticker", "Shares", "Avg Buy Price"]]
+            return result_dfs, saved_market
+            
+        # New format
+        if portfolios:
+            for m, rows in portfolios.items():
+                if rows:
+                    df = pd.DataFrame(rows)
+                    df["Remove"] = False
+                    df["Shares"] = pd.to_numeric(df["Shares"], errors="coerce").fillna(0).astype(int)
+                    df["Avg Buy Price"] = pd.to_numeric(df["Avg Buy Price"], errors="coerce").fillna(0.0)
+                    result_dfs[m] = df[["Remove", "Ticker", "Shares", "Avg Buy Price"]]
+                    
+        return result_dfs, saved_market
     except Exception:
-        return None, None
+        return {}, None
 
 def safe_secret_get(key: str, default: str = "") -> str:
     try:
@@ -312,6 +333,9 @@ else:
     suffix = ""
 
 # ── State initialization & LocalStorage Sync ────────────────────────────────
+if "all_portfolios" not in st.session_state:
+    st.session_state.all_portfolios = {}
+
 if "portfolio_df" not in st.session_state:
     # First-ever run in this session: start with defaults
     st.session_state.portfolio_df = default_df.copy()
@@ -321,25 +345,53 @@ if "portfolio_df" not in st.session_state:
 
 # Try to sync from browser LocalStorage if not already done
 if not st.session_state.ls_synced:
-    ls_df, ls_market = _load_portfolio()
-    if ls_df is not None:
-        # Success! Browser has data. Overwrite defaults.
-        st.session_state.portfolio_df = ls_df
-        st.session_state.market = ls_market
-        st.session_state.ls_synced = True
-        st.toast("✅ Portfolio restored from browser storage!", icon="💾")
-        st.rerun()
+    saved_dfs, ls_market = _load_portfolio()
+    if saved_dfs:
+        st.session_state.all_portfolios = saved_dfs
+        # If there's saved data for the currently selected market, load it.
+        # Otherwise, if the LocalStorage active market matches, use that.
+        if market in saved_dfs:
+            st.session_state.portfolio_df = saved_dfs[market].copy()
+        elif ls_market in saved_dfs:
+            st.session_state.portfolio_df = saved_dfs[ls_market].copy()
+            # Note: We do not overwrite st.session_state.market because the UI radio dictates it.
+        st.toast("✅ Portfolios restored from browser storage!", icon="💾")
+    st.session_state.ls_synced = True
+    st.rerun()
 
-# If the user manually toggles the Market radio button, reset to that market's defaults.
-# We do NOT call _save_portfolio here (that would collide with the auto-save below in
-# the same script run and trigger StreamlitDuplicateElementKey).  Instead we set a flag
-# and let the auto-save block handle it after rerun.
-if st.session_state.get("market") != market:
-    st.session_state.portfolio_df = default_df.copy()
-    st.session_state.market = market
+# ── Execute pending market switch (set at the BOTTOM of the previous run) ──
+# By the time this fires, session_state.portfolio_df holds the committed edits.
+if st.session_state.get("_pending_market"):
+    new_market_str = st.session_state.pop("_pending_market")
+    new_market_full = "🇮🇳 NSE (India)" if new_market_str == "NSE" else "🇺🇸 US Stocks"
+    
+    # Save the outgoing market to all_portfolios
+    st.session_state.all_portfolios[st.session_state.market] = st.session_state.portfolio_df.copy()
+
+    # Load the new market from all_portfolios, or default
+    if new_market_full in st.session_state.all_portfolios:
+        st.session_state.portfolio_df = st.session_state.all_portfolios[new_market_full].copy()
+    else:
+        if new_market_str == "NSE":
+            reset_df = pd.DataFrame({
+                "Remove":        [False, False, False, False, False],
+                "Ticker":        ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"],
+                "Shares":        [10, 5, 8, 15, 20],
+                "Avg Buy Price": [2800.0, 3500.0, 1600.0, 1700.0, 800.0],
+            })
+        else:
+            reset_df = pd.DataFrame({
+                "Remove":        [False, False, False, False, False],
+                "Ticker":        ["AAPL", "MSFT", "GOOGL", "NVDA", "META"],
+                "Shares":        [10, 8, 5, 6, 7],
+                "Avg Buy Price": [175.0, 380.0, 140.0, 480.0, 340.0],
+            })
+        st.session_state.portfolio_df = reset_df.copy()
+
+    st.session_state.market = new_market_full
     st.session_state.deleted_rows = []
     st.session_state.ls_synced = True
-    st.session_state.last_saved_state = ""  # force auto-save to trigger on next run
+    st.session_state.last_saved_state = st.session_state.portfolio_df.to_json()
     st.rerun()
 
 # ── Undo Button ─────────────────────────────────────────────────────────────
@@ -353,7 +405,7 @@ if st.session_state.get("deleted_rows"):
         st.rerun()
 
 # ── Data Editor ──────────────────────────────────────────────────────────────
-editor_key = f"holdings_editor_{len(st.session_state.portfolio_df)}"
+editor_key = f"holdings_editor_{st.session_state.market}_{len(st.session_state.portfolio_df)}"
 
 edited_df = st.data_editor(
     st.session_state.portfolio_df,
@@ -380,17 +432,23 @@ if removed_mask.any():
 
 holdings_input = edited_df.drop(columns=["Remove"])
 
-# ── Silent Auto-Save ─────────────────────────────────────────────────────────
-# Compare the current editor state to the last saved state to trigger autosaves
-# without mutating st.session_state.portfolio_df (which breaks UI focus)
+# ── Silent Auto-Save + session_state commit ──────────────────────────────────
 current_state_str = edited_df.to_json()
 if "last_saved_state" not in st.session_state:
     st.session_state.last_saved_state = current_state_str
 
 if current_state_str != st.session_state.last_saved_state:
+    st.session_state.portfolio_df = edited_df.copy()
     _save_portfolio(edited_df, market)
     st.session_state.last_saved_state = current_state_str
     st.session_state.ls_synced = True
+
+# ── Detect market switch and schedule it for the NEXT run ────────────────────
+if st.session_state.get("market") != market:
+    # Save the outgoing portfolio before scheduling the switch.
+    _save_portfolio(st.session_state.portfolio_df, st.session_state.get("market", market))
+    st.session_state["_pending_market"] = "NSE" if "NSE" in market else "US"
+    st.rerun()
 
 st.caption("💡 **Tip:** Check the **🗑️ box** to instantly remove a stock, or click the empty bottom row to add a new one.")
 st.caption("🟢 *Auto-saving in real-time to your browser*")
