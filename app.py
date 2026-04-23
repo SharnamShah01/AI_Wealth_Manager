@@ -25,13 +25,19 @@ from datetime import datetime, timedelta
 _ls = LocalStorage()
 LS_KEY = "ai_wm_portfolio_v1"
 
+# Each call to _ls.setItem must use a different `key` within the same Streamlit
+# run to avoid StreamlitDuplicateElementKey.  We use a simple counter stored in
+# session_state so that every invocation gets a unique widget key.
 def _save_portfolio(df: pd.DataFrame, mkt: str) -> None:
     """Serialise the portfolio and write it to the browser's LocalStorage."""
     payload = {
         "market": mkt,
         "rows": df.drop(columns=["Remove"], errors="ignore").to_dict(orient="records"),
     }
-    _ls.setItem(LS_KEY, json.dumps(payload))
+    # Increment a per-session counter so every setItem call has a unique key.
+    _save_ctr = st.session_state.get("_ls_save_ctr", 0) + 1
+    st.session_state["_ls_save_ctr"] = _save_ctr
+    _ls.setItem(LS_KEY, json.dumps(payload), key=f"_ls_set_{_save_ctr}")
 
 def _load_portfolio() -> tuple:
     """
@@ -324,13 +330,17 @@ if not st.session_state.ls_synced:
         st.toast("✅ Portfolio restored from browser storage!", icon="💾")
         st.rerun()
 
-# If the user manually toggles the Market radio button, reset to that market's defaults
+# If the user manually toggles the Market radio button, reset to that market's defaults.
+# We do NOT call _save_portfolio here (that would collide with the auto-save below in
+# the same script run and trigger StreamlitDuplicateElementKey).  Instead we set a flag
+# and let the auto-save block handle it after rerun.
 if st.session_state.get("market") != market:
     st.session_state.portfolio_df = default_df.copy()
     st.session_state.market = market
     st.session_state.deleted_rows = []
-    _save_portfolio(st.session_state.portfolio_df, market)
-    st.session_state.ls_synced = True 
+    st.session_state.ls_synced = True
+    st.session_state.last_saved_state = ""  # force auto-save to trigger on next run
+    st.rerun()
 
 # ── Undo Button ─────────────────────────────────────────────────────────────
 if st.session_state.get("deleted_rows"):
