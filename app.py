@@ -30,14 +30,21 @@ LS_KEY = "ai_wm_portfolio_v1"
 # session_state so that every invocation gets a unique widget key.
 def _save_portfolio(df: pd.DataFrame, mkt: str) -> None:
     """Serialise the portfolio and write it to the browser's LocalStorage."""
-    # We maintain `st.session_state.all_portfolios` = {"NSE": df1, "US": df2}
+    # We maintain `st.session_state.all_portfolios` as a dictionary of DataFrames
     portfolios = st.session_state.get("all_portfolios", {})
-    portfolios[mkt] = df.drop(columns=["Remove"], errors="ignore").to_dict(orient="records")
+    portfolios[mkt] = df.copy()
     st.session_state.all_portfolios = portfolios
+
+    serializable_portfolios = {}
+    for m, p_df in portfolios.items():
+        if isinstance(p_df, pd.DataFrame):
+            serializable_portfolios[m] = p_df.drop(columns=["Remove"], errors="ignore").to_dict(orient="records")
+        else:
+            serializable_portfolios[m] = p_df # Fallback in case of raw list
 
     payload = {
         "market": mkt, # active market when saved
-        "portfolios": portfolios
+        "portfolios": serializable_portfolios
     }
     # Increment a per-session counter so every setItem call has a unique key.
     _save_ctr = st.session_state.get("_ls_save_ctr", 0) + 1
@@ -405,7 +412,7 @@ if st.session_state.get("deleted_rows"):
         st.rerun()
 
 # ── Data Editor ──────────────────────────────────────────────────────────────
-editor_key = f"holdings_editor_{st.session_state.market}_{len(st.session_state.portfolio_df)}"
+editor_key = f"holdings_editor_{st.session_state.market}"
 
 edited_df = st.data_editor(
     st.session_state.portfolio_df,
